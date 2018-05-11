@@ -684,3 +684,281 @@ public class StoreFeignConf{
 }
 ```
 
+## 6 Zuul
+
+### 6.1 Zuul: 路由器&过滤器
+
+​	Route是一个完整的服务项目中必不可少的部分。例如`/`可能对应于你的web服务，`/api/users`对应于用户服务,`/api/shops`对应于商城服务。Zuul 是一个基于JVM的服务端负载均衡器。
+
+Netflix使用zuul做如下的事情:
+
+- 认证(*Authentication*)
+- 服务观察(*Insights*)
+- 压力测试(*Stress Testing*)
+- 局部测试?(*Canary Testing*):A change in programming is pushed to small group of end user after testing in sandbox environment without the end user knowledge & is reversed when the team find the code is having bug.
+- 动态路由(*Dynamic Routing*)
+- 服务迁移(*Service Migration*)
+- 负载均衡(*Load Shedding*)
+- 安全控制(Security)
+- 静态资源处理(*Static Response handling*)
+- 开启/关闭流量管理(*Active/DeActive traffic management)
+
+Zuul 的规则引擎允许用任意基于jvm的语言来实现`rule`和`filter`，但是默认支持`Java`和`Groovy`。
+
+> 注意：
+>
+> 1. 配置参数`zuul.max.host.connections`已经被拆分为两个参数`zuul.host.maxTotalConnections`和`zuul.host.maxPreRouteConnections`其默认值分别为:200和20。
+> 2. 默认所有router的Hytrix隔离模式(*ExecutionIsolationStrategy*)是`SEMAPHORE`(信号量)。`zuul.ribbonIsolationStrategy`可以被修改为`THREAD`(线程)。
+
+### 6.2 如何引入zuul
+
+引入`org.springframework.cloud`的`spring-cloud-starter-neflix-zuul`模块即可。
+
+### 6.3 zuul 内嵌的反向代理(Reverse Proxy)
+
+Spring Cloud已经创建了一个内嵌的Zuul Proxy来将会常用的调用(UI应用想请求调用一个或者多个后端服务)。这种特性对于使用用户自定义接口代理后端服务的场景，这种场景通常是不需要为所有的后端服务单独管理跨域和认证的情景。
+
+在Spring Boot 主程序入口class(main class)加上`@EnableZuulProxy`即可。根据约定，一个名为服务 ID (*serviceID*)为"users"的服务，将会受到来自`/users`的代理请求。该代理使用Ribbon从Eureka Server发现服务的实体，所有的请求都在`hystrix command`中执行，如果请求执行失败会在Hystrix mertics中有所反应，如果断路器已打开，那么代理不会再去请求对应的服务。
+
+默认情况下Zuul starter不包含服务发现客户端，所以要实现根据service id来代理的功能需要在classpath提供一个Discover Client。例如:spring-cloud-starter-netflix-eureka就是个不错的选择。
+
+想要阻止服务被自动添加到代理中，可以在`zuul.ignored-services`中增加service id。如果一个服务匹配到ignore-services但是同时也声明在route map，那么它不会被忽略。例如:
+
+```properties
+zuul.ignoredServices='*
+zuul.routes.users=/myusers/**
+```
+
+在这个例子中，除了users服务外其别的服务都会被忽略。
+
+如果想参数化或者改变路由规则，可以增加外部配置项来实现:
+
+```properties
+zuul.routes.users=/myusers/**
+```
+
+则表示调用`myusers`的 HTTP 请求将会被转发到`users`服务，例如(`myusers/101`将会被转发到users服务的`/101`)。
+
+想要更精细的控制route，可以指定单独的指定`path`和`serviceId`:
+
+```properties
+zuul.routes.users.path=/myusers/**
+zuul.routes.users.serviceId=users_service
+```
+
+这表示调用`myusers`的 HTTP 请求会被转发到`users_service`服务。`path`支持ant-style的匹配模式，所以`/myusers/*`仅匹配一种模式，但是`/myusers/**`可以匹配继承的模式。
+
+后端服务要么以`serviceId`(从Discovery获取例如Eureka)要么以`url`(物理地址)界定，例如:
+
+```properties
+zuul.routes.users.path=/myusers/**
+zuul.routes.users.url=http://user-service-stg1/users_service
+```
+
+这种简单的url-routes不能在`HystrixCommand`中执行也不能通过`Ribbon`在多 URL 中负载均衡。要达到这个目的，可以在静态服务列表中指定`serviceId`。
+
+```properties
+zuul.routes.users.path=/myusers/**
+zuul.routes.users.serviceId=myusers-service
+zuul.routes.users.stripPrefix=true
+
+hystrix.command.myusers-service.execution.isolation.thread.timeoutInMilliseconds=500
+myusers-service.ribbon.NIWSServerListClassName=com.netflix.loadbalancer.ConfigurationBasedServerList
+myusers-service.ribbon.ListOfServers=http://user-service.com,http://user-stg1.com
+myusers-service.ribbon.ConnectTimeout=1000
+myusers-service.ribbon.ReadTimeout=3000
+myusers-service.ribbon.MaxTotalHttpConnections=500
+myusers-service.ribbon.MaxConnectionsPerHost=100
+```
+
+另一种办法是指定一个服务路由并且用serviceId配置Ribbon客户端。
+
+```properties
+zuul.routes.users.path=/myusers/**
+zuul.routes.users.serviceId=user-service
+
+ribbon.eureka.enabled=false
+users.ribbon.listOfServers=user-service.com,user-stg .com
+```
+
+除此之外，还可以通过使用正则表达式的方式来实现。例如:
+
+```java
+@Configuration
+public class ZuulConfig{
+    @Bean
+    public PatternServiceRouteMapper serviceRouteMapper(){
+        return new PatternServiceRouteMapper(
+            "(?<name>^.+)-(?<version>v.+$)",
+            "${version}/${name}"
+        );
+    }
+}
+```
+
+这表示服务Id为`myusers-v1`的服务将会被映射到`/v1/myusers/**`。任意的正则表达式都可以被接收，但是所有被命名的组在`servicePattern`和`routePattern`中都有所体现。如果`servicePattern`不匹配`serviceId`，将会使用默认操作。在上边这个例子中服务Id为`myusers`的服务将会被映射到`/myusers/**`(因为这个Id没有版本号)。这个特性默认是关闭的并且仅仅只支持:服务注册中心模式。
+
+如果要给所有请求都添加一个前缀可以为`zuul.prefix`设置一个值，例如`/api`。默认情况下代理前缀在请求被转发到特定服务之前会被去除掉。关闭掉这个服务可以配置`zuul.stripPrefix=false`。你也可以为每个特定的服务关闭这个功能:
+
+```properties
+zuul.routes.users.path=/myusers/**
+zuul.routes.users.stripPrefix=false
+```
+
+> 注意:`zuul.stripPrefix`仅仅适用于`zuul.prefix`。对于定义在特定的路由的`path`属性没有任何作用。
+
+在上边这个例子中`myusers/101`会被转发到`users` 服务的`myusers/101`而不是`/101`。
+
+`zuul.routes`实体实际上会绑定一个`zuulProperties`。如果你查看这个参数你会发现它还含有一个`retrykable`的标识。如果设置这个参数为`true`ribbon客户端将会自动的重试失败的请求。你也可以修改ribboin客户端相关重试操作的参数。
+
+`X-Forwared-Host` 头会被默认添加到转发请求中。要关闭这个服务可以设置`zuul.addProxyHeads=false`。默认情况下前缀路径会被截取掉，调用后端的服务会获取一个叫`X-Forwarded-Prefix`的头信息，例如:`/myusers`。
+
+一个拥有`@EnableZuulProxy`的应用如果设置默认的路由为`/`,那么它可以作为一个单独的实例运行，例如:`zuul.route.home=/`例如(`/**`)将会转发所有的请求到`home`服务。
+
+如果需要更精细化的忽略规则，可以指定特定的规则。这些规则会在路由地址之前被分析，也就是说前缀也会被包含到你先被匹配的模式中。忽略模式跨越所有服务并且取代任意其他的个性化设置。
+
+```properties
+zuul.ignoredPatterns=/**/admin/**
+zuul.routes.users=/myusers/**
+zuul.routes.users.serviecId=user-services
+```
+
+该配置表示`/myusers/101`的请求将会被转发到users对应的`user-services`服务。但是包含`/admin`的将不会被代理。
+
+> 注意：
+>
+> 如果你想你的路由规则包含顺序性(*order*)那么你必须使用YAML文件，因为使用propreties文件将会丢失顺序。个人认为应该是properties对应的是一个无顺序特性的Map.
+>
+> 例如:
+>
+> ```yaml
+> zuul:
+>  routes:
+>   users:
+>    path:/myuers/**
+>   legacy:
+>    path:/**
+> ```
+>
+> 如果你使用properties文件,`legacy`路径可能在`users`路径之前被截止，从而导致`users`服务不能被访问。
+
+
+
+### 6.4 Zuul Http Client
+
+zuul默认现在默认使用的 HTTP 客户端是 Apache HTTP Client 用来替代已经过时的Ribbon `RestClient`。如果想要使用`RestClient`或者使用`okhttp3.OkHttpClient`可以分别设置`ribbon.restclient.enabled=true`、`ribbon.okhttp.enabled=true`。如果想要定制化 Apache HTTP客户端或者OK HTTP 客户端，可以提供`ClosableHttpClient`或者`OkHttpClient`的实例Bean。
+
+### 6.5 Cookies 和敏感的头信息
+
+在同一个系统中的各个服务间共享头信息是可行的。但是你可能不希望敏感的头信息被分发到外部服务中。你可以指定一个需要忽略的头信息列表作为route配置的一部分。Cookies因为他们在浏览器中有良好的定义语义，所以他们总是被当做敏感的信息。如果你的代理是一个浏览器，那么这些下游服务的cookies会给用户造成困惑，因为所有的后端服务看起来来自同一个地方。
+
+如果你小心翼翼的设计你的服务，例如:仅仅下游一个服务设置cookies,那么让cookies遵从从后端服务到调用者的规则。如果代理(zuul router)设置cookies，并且所有的后端服务都是同一个系统中的，那么也可以单纯的共享他们。初次之外，任何下游服务设置的cookies都不能被调用者使用。所以，请记住将`Set-Cookie`(至少)和`Cookie`加入到敏感头信息的router不是你服务中的一部分。即使router是服务的一部分，也要仔细考量。
+
+敏感头信息可以参考如下配置:
+
+```properties
+zuul.routes.users.path=/myusers/**
+zuul.routes.users.sensitiveHeaders=Cookie,Set-Cookie,Authorization
+zuul.routes.users.serviceId=user-services
+```
+
+以上的敏感头信息是默认配置项，因此默认情况下zuul也不会转发这些头信息，如果你想要传递所有的头信息需要设置一个空的`sensitiveHeaders`:
+
+```properties
+zuul.routes.users.sensitiveHeaders=
+```
+
+### 6.6 管理服务(Endpoints)
+
+如果`@EnableZuulProxy`和Spring Boot Actuator配合使用，那么摸了将会开启两个额外的服务:
+
+- Routes
+- Filters
+
+#### 6.6.1 Routes EndPoints
+
+ 如有服务的`/routes`的 GET 请求方式将会返回一个映射的路由列表:
+
+GET /routes
+
+```json
+{
+    /stores/**:"http://localhost:8001"
+}
+```
+
+额外的路由详情可以通过添加请求参数`?format=details`到`/routes`之后:
+
+GET /routes?format=details
+
+```json
+{
+  "/stores/**": {
+    "id": "stores",
+    "fullPath": "/stores/**",
+    "location": "http://localhost:8081",
+    "path": "/**",
+    "prefix": "/stores",
+    "retryable": false,
+    "customSensitiveHeaders": false,
+    "prefixStripped": true
+  }
+}
+```
+
+该路径的 POST 请求将会刷新已存在的路由。可以通过配置`endpoints.routes.enabled=false`来关闭这个服务。
+
+#### 6.6.2 Filters Endpoint
+
+`/filters`的GET请求将会返回一个zuul filter类型的map。
+
+### 6.7 压缩模式和本地跳转
+
+迁移一个已存在的应用或者 API 的通常做法是"勒死"老的服务，然后慢慢替换不同的实现。Zuul Proxy 是这种场景的很不错的工具，因为他可以处理所有老服务的流量，并转发部分请求到新的服务。例如:
+
+application.yml
+
+```yaml
+zuul:
+ routes:
+  first:
+   path:/first/**
+   url:http://one.example.com
+  second:
+   path:/second/**
+   url:forward:/second
+  third:
+   path:/third/**
+   url:forward:/3rd
+  legacy:
+   path:/**
+   url:http://legacy.example.com
+   
+```
+
+ 在这个例子中我们使用`legacy`实例来处理所有不能匹配其他规则的请求。`/first/**`路径下的请求被提取到一个新的 URL。`/second/**`下的服务也被转发，所以他们可以被本地化处理。例如一个普通的Spring`RequestMapping`。`/third/**`下的地址也被转发了，但是他们拥有不同的前缀，例如(`/third/foo`被转发到`/3rd/foo`)。
+
+### 6.8 通过zuul上传文件
+
+如果你使用`@EnableZuulProxy`你可以用来代理路径来上传文件。他仅仅支持上传文件很小的场景。对于大文件需要一个额外的路径来绕过 Spring的`DispatcherServlet到`/zuul/*路径下。例如是`zuul.routes.customers=/customers`,那么你可以通过 POST 方式发送到文件到`zuul/coustomers/`。Servlet路径是通过`zuul.servletPath`来具体化的。除此之外，大文件也需要增加超时时间的设置，如果proxy使用ribbon负载均衡器等。
+
+application.yml
+
+```Yaml
+hystrix.command.default.execution.isolation.thread.timeoutInMillisecond:60000
+ribbon:
+ connectTimeout:3000
+ ReadTimeout:600000
+```
+
+### 6.9 原始内嵌的zuul
+
+你也可以运行Zuul 服务而不需要代理，或者有选择的开启代理平台。如果你使用`@EnableZuulServer`（来取代`@EnableZuulProxy`）。任何你加载到应用中的`ZuulFilter`实例都将被自动加载。如果他们是运行在`@EnableZuulProxy`项目中，任何的proxy filter都不会被自动加载。
+
+在这种情况下，进入zuul server的route，依旧由`zuul.routes.*`的配置项来管理，但是没有服务发现和代理(客户端代理也就是客户端负载均衡)，所以`serviceId`和`url`配置会被忽略。例如:
+
+```properties
+zuul.routes.api=/api/**
+```
+
+ 该配置表示所有'/api/**'路径的请求将会被映射到Zuul  filter chain.

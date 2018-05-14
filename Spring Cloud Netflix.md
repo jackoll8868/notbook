@@ -1196,4 +1196,213 @@ Zuul 被实现为Servlet。通常情况下，zuul内嵌到Spring的Dispatch机�
 
 #### 6.15.3 @EnableZuulProxy VS. @EnabeleZuulServer
 
-Spring Cloud Netflix 默认加载的filter, 在@EnableZuulProxy的情况下其加载的filter是@EnableZuulServer的超集。换句话说，``EnableZuulProxy`包含`@EnableZuulServer` 所有的Filter。
+Spring Cloud Netflix 默认加载的filter, 在@EnableZuulProxy的情况下其加载的filter是@EnableZuulServer的超集。换句话说，`EnableZuulProxy`包含`@EnableZuulServer` 所有的Filter。
+
+#### 6.15.4 @EnableZuulServer Filters
+
+创建`SimpleRouteLocator`会默认加载springboot 配置下定义的route。
+
+下列的Filter会被加载:
+
+Pre Filters:
+
+- `ServletDetectionFilter`:判断当前这个请求是否通过Spring Dispatch传递过来。可以设置通过`FilterConstants.IS_DISPATCHER_SERVLET_REQUEST_KEY`实现。
+- `FormBodyWrapperFilter`:请求参数封装；
+- `DebugFilter`:如果`debug`请求的参数被设置，这个filter设置`RequestContext.setDebugRouteing()`和`RequestContext.setDebugRequest()`为true;
+
+Route Filter:
+
+- `SendForwardFilter`:这个filter使用Servlet`RequestDispatcher`转发请求。转发地址存储在`RequsetContext`的`FilterConstants.FOWRARD_TO_KEY`参数中。这个对于转发请求到本地服务的方式很便利;
+
+POST Filter:
+
+- `SendResponseFilter`:将代理请求的response写到当前response.
+
+ Error Filter:
+
+- `SendErrorFilter`: 默认情况下如果`RequestContext.getThrowable()`是null，会被转发到`/error`路径下。默认的`/error`可以通过`error.path`参数配置。
+
+#### 6.15.5 `@EnableZuulProxy` Filters
+
+ 创建一个`DiscoveryClientRouteLocator`会通过`DiscoveryClient`和`propperties`加载相关路由。`DiscoveryClient`会为每个`serviceId`创建一个route。当新的服务被添加，routes会被重新刷新。
+
+默认加载的Filter:
+
+PRE Filters:
+
+- `PreDecorationFilters`:这个filter根据`RouteLocator`来判断代理到何处以及如何代理。同时它还会为下游的服务设置各种而言的头部信息。
+
+Route Filters:
+
+- `RibbonRoutingFilter`: 这个Filter使用Ribbon和Hystrix以及配置的HTTP客户端来发送请求。Service Id 可以通过`RequestContext`的`FilterConstants.SERVICE_ID_KEY`来获取。这个Filter可以使用不同的HTTP CLIENT:
+  -  Apache `HttpClient`: 默认使用;
+  - `OkHttpClient` V3，添加`com.squareup.okhttp:okhttp`依赖同时设置`ribbon.okhttp.enabled=true`。
+  - Netflix Ribbon Http Client.设置`ribbon.restclient.enabled=true`即可使用。这种客户端有一定的局限性，例如不支持PATCH方法，但是它支持重试。
+- `SimpleHostRoutingFilter`：这个Filter通过Apache  HttpClient 发送请求到预处理的URL。URL可以在`RequestContext.getRouteHost()`获取。
+
+#### 6.15.6 自动以Zuul Filter
+
+参见:[Sample Zuul Filters](https://github.com/spring-cloud-samples/sample-zuul-filters)。
+
+#### 6.15.7 如何编写Pre Filter
+
+```java
+public class QueryParamPreFilter extends ZuulFilter {
+	@Override
+	public int filterOrder() {
+		return PRE_DECORATION_FILTER_ORDER - 1; // run before PreDecoration
+	}
+
+	@Override
+	public String filterType() {
+		return PRE_TYPE;
+	}
+
+	@Override
+	public boolean shouldFilter() {
+		RequestContext ctx = RequestContext.getCurrentContext();
+		return !ctx.containsKey(FORWARD_TO_KEY) // a filter has already forwarded
+				&& !ctx.containsKey(SERVICE_ID_KEY); // a filter has already determined serviceId
+	}
+    @Override
+    public Object run() {
+        RequestContext ctx = RequestContext.getCurrentContext();
+		HttpServletRequest request = ctx.getRequest();
+		if (request.getParameter("foo") != null) {
+		    // put the serviceId in `RequestContext`
+    		ctx.put(SERVICE_ID_KEY, request.getParameter("foo"));
+    	}
+        return null;
+    }
+}
+```
+
+这个 Filter通过request parameter的`foo`参数来获取`SERVER_ID`。实际中，是不允许这种直接映射的方式的。最好是从`foo`的值获取。
+
+因为`SERVICE_ID`一旦被设置那么`PreDecorationFilter`不会被执行但是`RibbonRoutingFilter`会执行。如果想要路由到一个完整的URL，调用`ctx.setRouteHost(url)`。
+
+#### 6.15.8 如何编写Route Filter
+
+Route filters在pre filters之后执行，用来为其他服务创建请求。通常情况下这类filter根据客户的请求方式转换Request和Response。
+
+```java
+public class OkHttpRoutingFilter extends ZuulFilter {
+	@Autowired
+	private ProxyRequestHelper helper;
+
+	@Override
+	public String filterType() {
+		return ROUTE_TYPE;
+	}
+
+	@Override
+	public int filterOrder() {
+		return SIMPLE_HOST_ROUTING_FILTER_ORDER - 1;
+	}
+
+	@Override
+	public boolean shouldFilter() {
+		return RequestContext.getCurrentContext().getRouteHost() != null
+				&& RequestContext.getCurrentContext().sendZuulResponse();
+	}
+
+    @Override
+    public Object run() {
+		OkHttpClient httpClient = new OkHttpClient.Builder()
+				// customize
+				.build();
+
+		RequestContext context = RequestContext.getCurrentContext();
+		HttpServletRequest request = context.getRequest();
+
+		String method = request.getMethod();
+
+		String uri = this.helper.buildZuulRequestURI(request);
+
+		Headers.Builder headers = new Headers.Builder();
+		Enumeration<String> headerNames = request.getHeaderNames();
+		while (headerNames.hasMoreElements()) {
+			String name = headerNames.nextElement();
+			Enumeration<String> values = request.getHeaders(name);
+
+			while (values.hasMoreElements()) {
+				String value = values.nextElement();
+				headers.add(name, value);
+			}
+		}
+
+		InputStream inputStream = request.getInputStream();
+
+		RequestBody requestBody = null;
+		if (inputStream != null && HttpMethod.permitsRequestBody(method)) {
+			MediaType mediaType = null;
+			if (headers.get("Content-Type") != null) {
+				mediaType = MediaType.parse(headers.get("Content-Type"));
+			}
+			requestBody = RequestBody.create(mediaType, StreamUtils.copyToByteArray(inputStream));
+		}
+
+		Request.Builder builder = new Request.Builder()
+				.headers(headers.build())
+				.url(uri)
+				.method(method, requestBody);
+
+		Response response = httpClient.newCall(builder.build()).execute();
+
+		LinkedMultiValueMap<String, String> responseHeaders = new LinkedMultiValueMap<>();
+
+		for (Map.Entry<String, List<String>> entry : response.headers().toMultimap().entrySet()) {
+			responseHeaders.put(entry.getKey(), entry.getValue());
+		}
+
+		this.helper.setResponse(response.code(), response.body().byteStream(),
+				responseHeaders);
+		context.setRouteHost(null); // prevent SimpleHostRoutingFilter from running
+		return null;
+    }
+}
+```
+
+#### 6.15.9 如何编写Post Filters
+
+Post Filters主要操作response，下边的例子我们添加了一个随机的`UUID`和`X-Foo`头信息。
+
+```java
+public class AddResponseHeaderFilter extends ZuulFilter {
+	@Override
+	public String filterType() {
+		return POST_TYPE;
+	}
+
+	@Override
+	public int filterOrder() {
+		return SEND_RESPONSE_FILTER_ORDER - 1;
+	}
+
+	@Override
+	public boolean shouldFilter() {
+		return true;
+	}
+
+	@Override
+	public Object run() {
+		RequestContext context = RequestContext.getCurrentContext();
+    	HttpServletResponse servletResponse = context.getResponse();
+		servletResponse.addHeader("X-Foo", UUID.randomUUID().toString());
+		return null;
+	}
+}
+```
+
+
+
+#### 6.15.10 Zuul 错误如何执行
+
+如果在Zuul Filter执行期间有异常抛出，error filter会被执行。`SendErrorFilter`仅在`RequestContext.getThrowable()`不为空的情况下执行。然后它会指定`javax.servlet.error.*`参数到request然后将request转发到Spring  Boot 的错误页面。
+
+#### 6.15.11 Zuul Eager Applicaiton Context Loading
+
+Zuul内部使用的Ribbon客户端默认是使用lazy load的。如果要修改这个行为，可以使用:
+
+`zuul.ribbon.eager-load.enabled=true`。
+

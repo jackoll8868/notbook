@@ -41,12 +41,23 @@ Spring Cloud 会为Zuul创建一个ServletContent,在ServletContent中做如下�
 > 1. 需要统一处理异常的；
 > 2. 需要对后端服务再封装的。
 
-## @EnableZuulProxy默认加载的Filter
 
-| FilterClass           | Filter Type | Order | shouldFilter                                                 | 处理逻辑                 | 备注 |
-| --------------------- | ----------- | ----- | ------------------------------------------------------------ | ------------------------ | ---- |
-| FormBodyWrapperFilter | PRE         | -1    | content-type包含APPLICATION_FORM_URLENCODED和MULTIPART_FORM_DATA | 将这两种请求格式进行封装 |      |
-| DebugFilter           | PRE         | 1     | zuul.debug.parameter=true时触发                              | 打印日志                 |      |
-| SendForwardFilter     | ROUTE       | 500   | ctx.containsKey(FORWARD_TO_KEY)       && !ctx.getBoolean(SEND_FORWARD_FILTER_RAN, false); |                          |      |
-| SendResponseFilter    | POST        | 1000  | context.getThrowable() == null       && (!context.getZuulResponseHeaders().isEmpty()          \|\| context.getResponseDataStream() != null          \|\| context.getResponseBody() != null) |                          |      |
 
+# @EnableZuulProxy默认加载的Filter
+
+| FilterClass           | Filter Type | Order | shouldFilter                                                 | 处理逻辑                 | 备注                 |
+| --------------------- | ----------- | ----- | ------------------------------------------------------------ | ------------------------ | -------------------- |
+| FormBodyWrapperFilter | PRE         | -1    | content-type包含APPLICATION_FORM_URLENCODED和MULTIPART_FORM_DATA | 将这两种请求格式进行封装 |                      |
+| DebugFilter           | PRE         | 1     | zuul.debug.parameter=true时触发                              | 打印日志                 |                      |
+| SendForwardFilter     | ROUTE       | 500   | ctx.containsKey(FORWARD_TO_KEY)       && !ctx.getBoolean(SEND_FORWARD_FILTER_RAN, false); |                          | 请求封装在这之前封装 |
+| SendResponseFilter    | POST        | 1000  | context.getThrowable() == null       && (!context.getZuulResponseHeaders().isEmpty()          \|\| context.getResponseDataStream() != null          \|\| context.getResponseBody() != null) | 将响应写回给客户端       | 响应封装在这之前结束 |
+
+如果需要实现:
+
+1. 统一记录日志，添加全局唯一 ID；
+2. 安全校验，验密验签；
+3. 封装请求到下游的服务；
+4. 将下游服务的请求封装给前端需要的格式；
+5. 统一异常处理；
+
+在实现相关Filter的时候需要注意 Filter 的Order值。

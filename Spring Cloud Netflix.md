@@ -962,3 +962,238 @@ zuul.routes.api=/api/**
 ```
 
  该配置表示所有'/api/**'路径的请求将会被映射到Zuul  filter chain.
+
+### 6.10 关闭Zuul Filters
+
+在Spring Cloud体系中Zuul在代理模式或者服务模式下都会自启动很多`ZuulFilter`。如果你想关闭某个Filter，可以设置`zuul.<SimpleClass name>.<filterType>.disable=true`。在`filters`包目录下的都是 `zuulFilters`。所以设置`zuul.SendResponseFilter.post.disable=true`可以关闭`org.srpingframework.cloud.netflix.zuul.filters.post.SendResponseFilter`。
+
+### 6.11 为Routers提供Hystrix Fallbacks
+
+当一个Zuul的router断路器打开了，你可以声明一个`ZuulFallbackProvider`的实体来创建一个Hystrix fallback.在这个实体内部，你需要指定fallback对应的route的 ID 并且提供一个返回`ClientHttpResponse`的方法给fallback。
+
+```java
+class MyZuulFallbackProvider implements ZuulFallbackProvider{
+    @Ovveride
+    public String getRoutes(){
+        return "customers";
+    }
+    
+    @Override
+    public ClientHttpResponse fallbackResponse(){
+        return new ClientHttpResponse(){
+          @Override
+            public HttpStatus getStatusCode() throws IOException{
+                return HttpStatus.OK;
+            }
+            @Override
+            public int getRawStatusCode() throws IOException{
+                return 200;
+            }
+            @Override
+            public String getStatusText() throws IOException{
+                return "OK";
+            }
+            @Override
+            public void close(){
+                
+            }
+            @Override
+            public InputStream getBody() throws IOException{
+                return new ByteArrayInputStream("fallback".getBytes());
+            }
+            @Override
+            public HttpHeads getHeaders(){
+                HttpHeaders headers = new HttpHeaders();
+                headers.setContentType(MediaType.APPLICATION_JSON);
+                return headers;
+            }
+        };
+    }
+    
+}
+```
+
+这个例子fallback如下的route:
+
+```properties
+zuul.routes.customers=/customers/**
+```
+
+如果你想给所有的routes提供一个默认的fallback，可以提供一个`getRoute()`返回`*`的`ZuulFallbackProvider`的实体。
+
+```java
+class MyFallbackProvider implements ZuulFallbackProvider {
+    @Override
+    public String getRoute() {
+        return "*";
+    }
+
+    @Override
+    public ClientHttpResponse fallbackResponse() {
+        return new ClientHttpResponse() {
+            @Override
+            public HttpStatus getStatusCode() throws IOException {
+                return HttpStatus.OK;
+            }
+
+            @Override
+            public int getRawStatusCode() throws IOException {
+                return 200;
+            }
+
+            @Override
+            public String getStatusText() throws IOException {
+                return "OK";
+            }
+
+            @Override
+            public void close() {
+
+            }
+
+            @Override
+            public InputStream getBody() throws IOException {
+                return new ByteArrayInputStream("fallback".getBytes());
+            }
+
+            @Override
+            public HttpHeaders getHeaders() {
+                HttpHeaders headers = new HttpHeaders();
+                headers.setContentType(MediaType.APPLICATION_JSON);
+                return headers;
+            }
+        };
+    }
+}
+```
+
+如果想要实现返回基于失败原因的`response`的`FallbackProvider`，可以：
+
+```java
+class MyFallbackProvider implements FallbackProvider {
+
+    @Override
+    public String getRoute() {
+        return "*";
+    }
+
+    @Override
+    public ClientHttpResponse fallbackResponse(final Throwable cause) {
+        if (cause instanceof HystrixTimeoutException) {
+            return response(HttpStatus.GATEWAY_TIMEOUT);
+        } else {
+            return fallbackResponse();
+        }
+    }
+
+    @Override
+    public ClientHttpResponse fallbackResponse() {
+        return response(HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+
+    private ClientHttpResponse response(final HttpStatus status) {
+        return new ClientHttpResponse() {
+            @Override
+            public HttpStatus getStatusCode() throws IOException {
+                return status;
+            }
+
+            @Override
+            public int getRawStatusCode() throws IOException {
+                return status.value();
+            }
+
+            @Override
+            public String getStatusText() throws IOException {
+                return status.getReasonPhrase();
+            }
+
+            @Override
+            public void close() {
+            }
+
+            @Override
+            public InputStream getBody() throws IOException {
+                return new ByteArrayInputStream("fallback".getBytes());
+            }
+
+            @Override
+            public HttpHeaders getHeaders() {
+                HttpHeaders headers = new HttpHeaders();
+                headers.setContentType(MediaType.APPLICATION_JSON);
+                return headers;
+            }
+        };
+    }
+}
+```
+
+### 6.13 Zuul  超时机制
+
+#### 6.13.1 服务发现配置
+
+如果Zuul使用服务发现机制，那么有两个超时时间需要配置。
+
+1. Hystrix timeout，因为所有routes默认都被封装在Hystrix  Commands；
+2. Ribbon Timeout。
+
+Hystrix的超时时间需要考虑到:Ribbon 超时时间+所有重试所消耗的时间。默认情况下Spring Cloud Zuul会默认计算好Hystrix超时时间，除非你单独指定Hystrix超时时间。
+
+Hystrix 超时时间按如下公式计算:
+
+```
+(ribbon.ConnectionTimeout+ribbon.ReadTimeout)*(ribbon.MaxAutoRetries+1)*(ribbon.MaxAutoRetriesNextServer+1)
+```
+
+例如，如下配置的Hystrix超时时间为:`2400ms`。
+
+```yaml
+ribbon:
+	ReadTimeOut:100
+	ConnectionTimeout:500
+	MaxAutoRetries:1
+	MaxAutpRetriesNextServer:1
+```
+
+> 注意:
+>
+> 1. 你可以通过配置`service.ribbon.*`来为每个单独的route设置Hystrix超时时间。
+> 2. 如果你不配置超时时间，默认情况下将会是:`4000ms`。
+
+如果你设置`hystrix.command.commandKey.execution.isolation.thread.timeoutInMilliseconds`，其中`commandKey`代表route id，或者设置`hystrix.command.default.execution.isolation.thread.timeoutInMilliseconds`那么这些字将会被用作Hystrix超时时间同时会忽略你配置的`ribbon.*`的相关超时参数。
+
+#### 6.13.2 URL 配置
+
+如果你通过URL的方式来配置Zuul Routes。设置`zuul.host.connection-timeout-mills`和`zuul.host.socket-timeout-millis`。
+
+### 6.14 重写`Location Header`
+
+如果Zuul当做一个前置的WebApplication，那么可能需要重写`Location`来应对通过`3xx`的http状态码进行跳转的需求。如果不重写，浏览器不会跳转到实际的web application url，而是在zuul url处停止跳转。`LocationRewriteFilter`可以用来重写Location Header为zuul的url。
+
+```java
+import org.springframework.cloud.netflix.zuul.filters.post.LocationRewriteFilter;
+...
+
+@Configuration
+@EnableZuulProxy
+public class ZuulConfig {
+    @Bean
+    public LocationRewriteFilter locationRewriteFilter() {
+        return new LocationRewriteFilter();
+    }
+}
+```
+
+### 6.15 zuul 开发者指南
+
+#### 6.15.1 Zuul Servlet
+
+Zuul 被实现为Servlet。通常情况下，zuul内嵌到Spring的Dispatch机制。这样允许Spring MVC控制路由。在这种场景下，Zuul被用来缓存请求。如果需要直接走Zuul而不是走请求缓存的路径(例如:大文件上传)，Servlet也在Spring Dispatcher之外被转载，默认情况下，这个路径为`/zuul`，可以通过`zuul.servlet-path`来修改。
+
+#### 6.15.2 Zuul RequestContext
+
+ 想要在各个Filter之间传递信息，可以使用`RequestContext`。他存储的数据被保存在`ThreadLocal`中，是请求唯一的，即每个request对应它只的数据。这些信息包括**将请求路由到哪里**、**错误**以及实际的**HttpServletRequest**和**HttpServletResponse**。`RequestContext`继承制`ConcurrentHashMap`所以任何数据都可以被缓存在这里。`FilterConstants`包含被Spring Cloud Netflix使用的Key。
+
+#### 6.15.3 @EnableZuulProxy VS. @EnabeleZuulServer
+
+Spring Cloud Netflix 默认加载的filter, 在@EnableZuulProxy的情况下其加载的filter是@EnableZuulServer的超集。换句话说，``EnableZuulProxy`包含`@EnableZuulServer` 所有的Filter。
